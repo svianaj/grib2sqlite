@@ -195,7 +195,18 @@ def get_proj4(gid):
         proj4["lat_0"] = 90.0  # FIXME: assuming Northern hemisphere!
     elif gridtype == "regular_ll":
         # CHECK
+        pkeys = ["longitudeOfFirstGridPointInDegrees",
+                 "longitudeOfLastGridPointInDegrees",
+                 ]
+        p4 = get_keylist(gid, pkeys, "double")
         proj4["proj"] = "latlong"
+        proj4['lon_wrap'] = round(sum(p4.values()) / 2.)
+
+        # use lon_wrap (center longitude) to make sure all values fall in same interval
+        # if min_lon = -180: lon_wrap=0 (default)
+        # if min_lon = 0: lon_wrap = 180 !!!
+        # but you must also be able to handle e.g. [-20,270]
+
     elif gridtype == "rotated_ll":
         pkeys = [
             "angleOfRotationInDegrees",
@@ -257,6 +268,11 @@ def get_gridinfo(gid):
     if gridtype in ["regular_ll", "rotated_ll"]:
         result["dx"] = gg["iDirectionIncrementInDegrees"]
         result["dy"] = gg["jDirectionIncrementInDegrees"]
+
+    if not gg["iScansPositively"]:
+        result["lon0"] = gg["longitudeOfLastGridPointInDegrees"]
+    if not gg["jScansPositively"]:
+        result["lat0"] = gg["latitudeOfLastGridPointInDegrees"]
     return result
 
 
