@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "grib2sqlite"
-version = "0.0.6"
+version = "0.0.7"
 description = "Extract/interpolate GRIB data to SQLite for verification in harp."
 authors = ["Alex Deckmyn <alex.deckmyn@meteo.be>"]
 readme = "README.md"

@@ -264,15 +264,19 @@ def get_gridinfo(gid):
         "dy": gg["DyInMetres"],
         "lon0": gg["longitudeOfFirstGridPointInDegrees"],
         "lat0": gg["latitudeOfFirstGridPointInDegrees"],
+        "wrap_x": False,
     }
     if gridtype in ["regular_ll", "rotated_ll"]:
-        result["dx"] = gg["iDirectionIncrementInDegrees"]
-        result["dy"] = gg["jDirectionIncrementInDegrees"]
+        result['dx'] = gg['iDirectionIncrementInDegrees']
+        result['dy'] = gg['jDirectionIncrementInDegrees']
+        logger.debug(f"{abs(360 - result['dx'] * result['nlon'])} vs {result['dx']}")
+        if abs(360 - result['dx'] * result['nlon']) < result['dx']:
+            result['wrap_x'] = True
 
-    if not gg["iScansPositively"]:
-        result["lon0"] = gg["longitudeOfLastGridPointInDegrees"]
-    if not gg["jScansPositively"]:
-        result["lat0"] = gg["latitudeOfLastGridPointInDegrees"]
+    if not gg['iScansPositively']:
+        result['lon0'] = gg['longitudeOfLastGridPointInDegrees']
+    if not gg['jScansPositively']:
+        result['lat0'] = gg['latitudeOfLastGridPointInDegrees']
     return result
 
 
@@ -432,28 +436,47 @@ def points_restrict(gid, plist):
     #    that is a fast way to eliminate most outside points
 
     minlon, maxlon, minlat, maxlat = get_grid_limits(gid)
+    gridinfo = get_gridinfo(gid)
+    nlon = gridinfo["nlon"]
+    nlat = gridinfo["nlat"]
 
     # reduce the table to the bounding box
     # Make a copy! The original retains old row numbers and becomes hard to manage.
-    p1 = plist[
-        (plist["lat"] >= minlat)
-        & (plist["lat"] <= maxlat)
-        & (plist["lon"] >= minlon)
-        & (plist["lon"] <= maxlon)
-    ].copy()
+    # FIXME: for a global grid, this will delete points that are
+    #        "between" the max and min longitude
+    #        e.g. if the grid is [0,...,359.95], what about 359.99?
+    #        the 0 meridian is pretty important, so we need to fix this
+    # NOTE: minlon, maxlon are always according to [-180,180],
+    #       even if the grid itself is [0,360] !!!
+    if gridinfo['wrap_x']:
+        p1 = plist[
+               (plist["lat"] >= minlat)
+                     & (plist["lat"] <= maxlat)
+                  ].copy()
+    else:
+        p1 = plist[
+              (plist["lat"] >= minlat)
+              & (plist["lat"] <= maxlat)
+              & (plist["lon"] >= minlon)
+              & (plist["lon"] <= maxlon)
+             ].copy()
 
     # 2. Now use grid index (requires projection)
     #    to decide which stations are inside the grid
     #    NOTE: we could skip step 1 and project all stations...
-    gridinfo = get_gridinfo(gid)
-    nlon = gridinfo["nlon"]
-    nlat = gridinfo["nlat"]
 
     lon = p1["lon"].tolist()
     lat = p1["lat"].tolist()
 
     i, j = get_gridindex(lon, lat, gid)
-    p2 = p1[(i > 0) & (i < nlon - 1) & (j > 0) & (j < nlat - 1)].copy()
+    if gridinfo['wrap_x']:
+        # if x wraps around the globe, don't restrict at all
+        # BUT: make sure to take this into account when interpolating!
+        # NOTE: Amundsen-Scott SP base has j==0 !
+        # With current code, i, j == 0 are OK, but == nlat|nlon-1 needs work
+        p2 = p1[ (j >= 0) & (j < nlat - 1)].copy()
+    else:
+        p2 = p1[(i >= 0) & (i < nlon - 1) & (j >= 0) & (j < nlat - 1)].copy()
     return p2
 
 
@@ -484,6 +507,8 @@ def get_gridpoints(gid):
 
     x_v, y_v = np.meshgrid(xxx, yyy)
     lons, lats = proj(x_v, y_v, inverse=True)
+    # NOTE: the inverse projection of a "wrapped" latlong
+    #       turns out to be [-180,180]
     return lons, lats
 
 
@@ -531,12 +556,19 @@ def train_weights(station_list, gid, lsm=False):
     # TODO: land/sea mask for T2m...
     if lsm:
         logger.warning("SQLITE: ignoring land/sea mask!")
+    # usually, station_list is a pandas table
+    # but why not also allow dicts with 'lat' and 'lon' lists
+    if isinstance(station_list, dict):
+        lat = np.array(station_list["lat"])
+        lon = np.array(station_list["lon"])
+    else:
+        lat = np.array(station_list["lat"].tolist())
+        lon = np.array(station_list["lon"].tolist())
 
-    lat = np.array(station_list["lat"].tolist())
-    lon = np.array(station_list["lon"].tolist())
     nstations = len(lon)
     i, j = get_gridindex(lon, lat, gid)
 
+    gridinfo = get_gridinfo(gid)
     # eccodes python interface only gives us distances
     # so we need to do some math for bilinear weights
     nearestweights = []
@@ -547,8 +579,17 @@ def train_weights(station_list, gid, lsm=False):
     # probably easy, just look at the index
     ic = np.round(i).astype("i4")
     jc = np.round(j).astype("i4")
+    # FIXME: in rare cases, when i/j are exactly integer, floor==ceil
+    # this happens e.g. with Amundsen-Scott South Pole base, j==0.
+    # In such cases we should interpolate between only 2 points.
     i0 = np.floor(i).astype("i4")
     i1 = i0 + 1  # np.ceil(i)
+    # In the very exceptional case that i0==nlon-1 (*exactly* on the outside border)
+    # we may not use i0+1, but since the weights will be zero anyway, we can change to
+    # any other value...
+    #if i0 == nlon - 1:
+    #    if i != i0:
+    #        # The points were not correctly constrained to domain!
     j0 = np.floor(j).astype("i4")
     j1 = j0 + 1  # np.ceil(j)
     di = i - i0
@@ -557,6 +598,14 @@ def train_weights(station_list, gid, lsm=False):
     w2 = (1 - di) * dj
     w3 = di * (1 - dj)
     w4 = di * dj
+    if gridinfo["wrap_x"]:
+        logger.info("The domain wraps around the globe.")
+        ic[ic == gridinfo["nlon"]] = 0
+        ic[ic == -1] = gridinfo["nlon"]
+        i1[i1 == gridinfo["nlon"]] = 0
+        i0[i0 == -1] = gridinfo["nlon"]
+
+
     for pp in range(nstations):
         nearestweights.append([[[ic[pp], jc[pp]], 1.0]])
         bilinweights.append(
@@ -964,6 +1013,7 @@ def parse_grib_file(
                 # We assume that station list and weights are the same for all GRIB fields
                 # so we only "train" once
                 # First reduce the station list to points inside the domain
+                nstation_orig = station_list.shape[0]
                 station_list = points_restrict(gid, station_list)
                 if station_list.shape[0] == 0:
                     # In this case, we can not extract any points
@@ -973,8 +1023,8 @@ def parse_grib_file(
                     break
 
                 logger.info(
-                    "SQLITE: selected {} stations inside domain.".format(
-                        station_list.shape[0])
+                    "SQLITE: selected {} stations inside domain from {}.".format(
+                        station_list.shape[0], nstation_orig)
                 )
                 # create a list of interpolation weights
                 logger.debug("SQLITE: training interpolation weights.")
