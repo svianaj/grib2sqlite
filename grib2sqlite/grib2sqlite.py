@@ -282,7 +282,7 @@ def get_gridinfo(gid):
 
 def get_grid_limits(gid):
     """Find bounding box (lat/lon) of a grid."""
-    lons, lats = get_gridpoints(gid)
+    lons, lats = get_grid_boundary(gid)
 
     minlat = np.floor(np.min(lats)) - 1
     minlon = np.floor(np.min(lons)) - 1
@@ -480,7 +480,7 @@ def points_restrict(gid, plist):
     return p2
 
 
-def get_gridpoints(gid):
+def get_grid_points(gid):
     """Get all lat/lon co-ordinates of the grid points.
 
     Args:
@@ -506,6 +506,43 @@ def get_gridpoints(gid):
         yyy[j] = y0 + (float(j) * dy)
 
     x_v, y_v = np.meshgrid(xxx, yyy)
+    lons, lats = proj(x_v, y_v, inverse=True)
+    # NOTE: the inverse projection of a "wrapped" latlong
+    #       turns out to be [-180,180]
+    return lons, lats
+
+def get_grid_boundary(gid):
+    """Get lat/lon co-ordinates of the grid boundary points.
+
+    Args:
+        gid: GRIB handle
+    Returns:
+        Numpy arrays with lat/lon values.
+    """
+    gridinfo = get_gridinfo(gid)
+    p4 = get_proj4(gid)
+    proj = Proj(p4)
+    nlon = int(gridinfo["nlon"])
+    nlat = int(gridinfo["nlat"])
+    dx = gridinfo["dx"]
+    dy = gridinfo["dy"]
+    # get SW corner
+    x0, y0 = proj(gridinfo["lon0"], gridinfo["lat0"])
+    xxx = np.fromiter( (x0 + i * dx for i in range(nlon)), float)
+    yyy = np.fromiter( (y0 + i * dy for i in range(nlat)), float)
+    x_v = np.concatenate((
+            xxx,
+            np.full(nlat-2, xxx[nlon-1]),
+            xxx[::-1],
+            np.full(nlat-2, xxx[0]),
+            ))
+    y_v = np.concatenate((
+            np.full(nlon-1, yyy[0]),
+            yyy,
+            np.full(nlon-2, yyy[nlat-1]),
+            yyy[:0:-1],
+            ))
+
     lons, lats = proj(x_v, y_v, inverse=True)
     # NOTE: the inverse projection of a "wrapped" latlong
     #       turns out to be [-180,180]
