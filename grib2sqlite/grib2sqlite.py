@@ -1,67 +1,74 @@
 #! /usr/bin/env python3
-"""sqlite_utils"""
+"""grib2sqlite: toolbox for extracting point data from GRIB fields."""
 
+import logging
 import os
-import eccodes
-from datetime import datetime
 import sqlite3
 from contextlib import closing
 from copy import deepcopy
+from datetime import datetime
+
+import eccodes
 import numpy as np
 from pyproj import Proj
-import sys
 
-import logging
 logger = logging.getLogger(__name__)
 console_handler = logging.StreamHandler()
 logger.addHandler(console_handler)
 formatter = logging.Formatter(
     "{levelname} - {message}",
     style="{",
-    )
+)
 console_handler.setFormatter(formatter)
-logger.setLevel('WARNING')  # actually, this is the default anyway
+logger.setLevel("WARNING")  # actually, this is the default anyway
 
 # some defaults
-basedir=os.path.dirname(__file__)
+basedir = os.path.dirname(__file__)
 default_parameter_list = basedir + "/data/param_list_default.json"
 default_station_list = basedir + "/data/station_list_default.csv"
 default_sqlite_template = "{MODEL}/{YYYY}/{MM}/FCTABLE_{PP}_{YYYY}{MM}.sqlite"
 
+
 def read_param_list(param_file):
     """Read a parameter file (json).
+
     Args:
-        param_list: name of a json file
+        param_file: name of a json file
 
     Returns:
         A dict containing the parsed parameter list
     """
     import json
+
     try:
         with open(param_file) as pf:
             parameter_list = json.load(pf)
             pf.close()
     except OSError:
-        logger.error(f"Can not read parameter file {param_file}")
+        logger.error("Can not read parameter file %s", param_file)
         raise
 
     return parameter_list
 
+
 def read_station_list(station_file):
-    """Read a parameter file (json).
+    """Read a station file (csv).
+
     Args:
-        station_list: name of a csv file
+        station_file: name of a csv file
 
     Returns:
         A pandas table containing the parsed station list
     """
     import pandas
+
     try:
         station_list = pandas.read_csv(station_file, skipinitialspace=True)
     except OSError:
-        logger.error(f"Can not read station file {station_file}")
+        logger.error("Can not read station file %s", station_file)
         raise
     return station_list
+
 
 def get_date_info(gid):
     """Forecast time, lead time, accumulation time etc. from GRIB record.
@@ -73,40 +80,40 @@ def get_date_info(gid):
         Forecast date/time and lead time as read from the grib record
     """
     keys = [
-        'editionNumber',
-        'dataDate',
-        'hour',
-        'minute',
-        'second',
+        "editionNumber",
+        "dataDate",
+        "hour",
+        "minute",
+        "second",
     ]
-    info = get_keylist(gid, keys, 'long')
-    if info['editionNumber'] == 1:
+    info = get_keylist(gid, keys, "long")
+    if info["editionNumber"] == 1:
         logger.info("GRIB-1 files are experimental.")
         keys2 = [
-            'stepUnits',
-            'endStep',
-            ]
-        info2 = get_keylist(gid, keys2, 'long')
+            "stepUnits",
+            "endStep",
+        ]
+        info2 = get_keylist(gid, keys2, "long")
         info = info | info2
-                
+
     else:
         # NOTE: using stepUnits as number is bugged (Nov 2024) for sub-hourly
         #       certainly in grib-2, probably also grib-1
         #       but avoid grib-1 for sub-hourly data!
         keys2 = [
-            'indicatorOfUnitOfTimeRange',
-            'forecastTime',
-            'productDefinitionTemplateNumber',
-            ]
-        info2 = get_keylist(gid, keys2, 'long')
+            "indicatorOfUnitOfTimeRange",
+            "forecastTime",
+            "productDefinitionTemplateNumber",
+        ]
+        info2 = get_keylist(gid, keys2, "long")
         info = info | info2
 
-        if info2['productDefinitionTemplateNumber'] == 8:
+        if info2["productDefinitionTemplateNumber"] == 8:
             keys3 = [
-                'indicatorOfUnitForTimeRange',
-                'lengthOfTimeRange',
-                ]
-            info3 = get_keylist(gid, keys3, 'long')
+                "indicatorOfUnitForTimeRange",
+                "lengthOfTimeRange",
+            ]
+            info3 = get_keylist(gid, keys3, "long")
             info = info | info3
     return date_from_gribinfo(info)
 
@@ -122,18 +129,18 @@ def date_from_gribinfo(info):
 
     """
     fcdate = datetime.strptime(
-        '{:8}T{:02}{:02}{:02}'.format(
-            info['dataDate'], info['hour'], info['minute'], info['second']
+        "{:8}T{:02}{:02}{:02}".format(
+            info["dataDate"], info["hour"], info["minute"], info["second"]
         ),
-        '%Y%m%dT%H%M%S',
+        "%Y%m%dT%H%M%S",
     )
 
-    if info['editionNumber'] == 1:
-        tunit = info['stepUnits']
-        leadtime = info['endStep']
+    if info["editionNumber"] == 1:
+        tunit = info["stepUnits"]
+        leadtime = info["endStep"]
     else:
-        tunit = info['indicatorOfUnitOfTimeRange']
-        leadtime = info['forecastTime']
+        tunit = info["indicatorOfUnitOfTimeRange"]
+        leadtime = info["forecastTime"]
 
     if tunit == 1:
         tscale = 3600.0
@@ -142,22 +149,22 @@ def date_from_gribinfo(info):
     elif tunit == 13:
         tscale = 1.0
     else:
-        logger.error(f"Unrecognised indicatorOfUnitOfTimeRange: {tunit}")
+        logger.error("Unrecognised indicatorOfUnitOfTimeRange: %i", tunit)
         return None
 
     leadtime *= tscale
 
     # At this point, leadtime may be just the START of accumulation (or min/max/mean) time
-    if info['editionNumber'] == 2 and info['productDefinitionTemplateNumber'] == 8:
-        tunit2 = info['indicatorOfUnitForTimeRange'] # NOTE: "For" vs "Of"
+    if info["editionNumber"] == 2 and info["productDefinitionTemplateNumber"] == 8:
+        tunit2 = info["indicatorOfUnitForTimeRange"]  # NOTE: "For" vs "Of"
         if tunit2 == 1:
-            lt2 = info['lengthOfTimeRange'] * 3600.0
+            lt2 = info["lengthOfTimeRange"] * 3600.0
         elif tunit2 == 2:
-            lt2 = info['lengthOfTimeRange'] * 60.0
+            lt2 = info["lengthOfTimeRange"] * 60.0
         elif tunit2 == 13:
-            lt2 = info['lengthOfTimeRange']
+            lt2 = info["lengthOfTimeRange"]
         else:
-            logger.error(f"Unrecognised indicatorOfUnitForTimeRange: {tunit2}")
+            logger.error("Unrecognised indicatorOfUnitForTimeRange: %i", tunit2)
             return None
         leadtime += lt2
 
@@ -175,7 +182,7 @@ def get_proj4(gid):
     """
     # NOTE: for now, we assume standard ACCORD Earth shape etc.
     # FIXME: for GRIB-2, we should retrieve the actual earth shape!
-    proj4 = {'R': 6371229}
+    proj4 = {"R": 6371229}
     gridtype = get_keylist(gid, ["gridType"], "string")["gridType"]
     if gridtype in ["lambert", "lambert_lam"]:
         pkeys = ["Latin1InDegrees", "Latin2InDegrees", "LoVInDegrees"]
@@ -195,12 +202,13 @@ def get_proj4(gid):
         proj4["lat_0"] = 90.0  # FIXME: assuming Northern hemisphere!
     elif gridtype == "regular_ll":
         # CHECK
-        pkeys = ["longitudeOfFirstGridPointInDegrees",
-                 "longitudeOfLastGridPointInDegrees",
-                 ]
+        pkeys = [
+            "longitudeOfFirstGridPointInDegrees",
+            "longitudeOfLastGridPointInDegrees",
+        ]
         p4 = get_keylist(gid, pkeys, "double")
         proj4["proj"] = "latlong"
-        proj4['lon_wrap'] = round(sum(p4.values()) / 2.)
+        proj4["lon_wrap"] = round(sum(p4.values()) / 2.0)
 
         # use lon_wrap (center longitude) to make sure all values fall in same interval
         # if min_lon = -180: lon_wrap=0 (default)
@@ -267,16 +275,16 @@ def get_gridinfo(gid):
         "wrap_x": False,
     }
     if gridtype in ["regular_ll", "rotated_ll"]:
-        result['dx'] = gg['iDirectionIncrementInDegrees']
-        result['dy'] = gg['jDirectionIncrementInDegrees']
-        logger.debug(f"{abs(360 - result['dx'] * result['nlon'])} vs {result['dx']}")
-        if abs(360 - result['dx'] * result['nlon']) < result['dx']:
-            result['wrap_x'] = True
+        result["dx"] = gg["iDirectionIncrementInDegrees"]
+        result["dy"] = gg["jDirectionIncrementInDegrees"]
+        logger.debug("%i vs %i", abs(360 - result["dx"] * result["nlon"]), result["dx"])
+        if abs(360 - result["dx"] * result["nlon"]) < result["dx"]:
+            result["wrap_x"] = True
 
-    if not gg['iScansPositively']:
-        result['lon0'] = gg['longitudeOfLastGridPointInDegrees']
-    if not gg['jScansPositively']:
-        result['lat0'] = gg['latitudeOfLastGridPointInDegrees']
+    if not gg["iScansPositively"]:
+        result["lon0"] = gg["longitudeOfLastGridPointInDegrees"]
+    if not gg["jScansPositively"]:
+        result["lat0"] = gg["latitudeOfLastGridPointInDegrees"]
     return result
 
 
@@ -448,18 +456,15 @@ def points_restrict(gid, plist):
     #        the 0 meridian is pretty important, so we need to fix this
     # NOTE: minlon, maxlon are always according to [-180,180],
     #       even if the grid itself is [0,360] !!!
-    if gridinfo['wrap_x']:
-        p1 = plist[
-               (plist["lat"] >= minlat)
-                     & (plist["lat"] <= maxlat)
-                  ].copy()
+    if gridinfo["wrap_x"]:
+        p1 = plist[(plist["lat"] >= minlat) & (plist["lat"] <= maxlat)].copy()
     else:
         p1 = plist[
-              (plist["lat"] >= minlat)
-              & (plist["lat"] <= maxlat)
-              & (plist["lon"] >= minlon)
-              & (plist["lon"] <= maxlon)
-             ].copy()
+            (plist["lat"] >= minlat)
+            & (plist["lat"] <= maxlat)
+            & (plist["lon"] >= minlon)
+            & (plist["lon"] <= maxlon)
+        ].copy()
 
     # 2. Now use grid index (requires projection)
     #    to decide which stations are inside the grid
@@ -469,12 +474,12 @@ def points_restrict(gid, plist):
     lat = p1["lat"].tolist()
 
     i, j = get_gridindex(lon, lat, gid)
-    if gridinfo['wrap_x']:
+    if gridinfo["wrap_x"]:
         # if x wraps around the globe, don't restrict at all
         # BUT: make sure to take this into account when interpolating!
         # NOTE: Amundsen-Scott SP base has j==0 !
         # With current code, i, j == 0 are OK, but == nlat|nlon-1 needs work
-        p2 = p1[ (j >= 0) & (j < nlat - 1)].copy()
+        p2 = p1[(j >= 0) & (j < nlat - 1)].copy()
     else:
         p2 = p1[(i >= 0) & (i < nlon - 1) & (j >= 0) & (j < nlat - 1)].copy()
     return p2
@@ -511,6 +516,7 @@ def get_grid_points(gid):
     #       turns out to be [-180,180]
     return lons, lats
 
+
 def get_grid_boundary(gid):
     """Get lat/lon co-ordinates of the grid boundary points.
 
@@ -528,20 +534,24 @@ def get_grid_boundary(gid):
     dy = gridinfo["dy"]
     # get SW corner
     x0, y0 = proj(gridinfo["lon0"], gridinfo["lat0"])
-    xxx = np.fromiter( (x0 + i * dx for i in range(nlon)), float)
-    yyy = np.fromiter( (y0 + i * dy for i in range(nlat)), float)
-    x_v = np.concatenate((
+    xxx = np.fromiter((x0 + i * dx for i in range(nlon)), float)
+    yyy = np.fromiter((y0 + i * dy for i in range(nlat)), float)
+    x_v = np.concatenate(
+        (
             xxx,
-            np.full(nlat-2, xxx[nlon-1]),
+            np.full(nlat - 2, xxx[nlon - 1]),
             xxx[::-1],
-            np.full(nlat-2, xxx[0]),
-            ))
-    y_v = np.concatenate((
-            np.full(nlon-1, yyy[0]),
+            np.full(nlat - 2, xxx[0]),
+        )
+    )
+    y_v = np.concatenate(
+        (
+            np.full(nlon - 1, yyy[0]),
             yyy,
-            np.full(nlon-2, yyy[nlat-1]),
+            np.full(nlon - 2, yyy[nlat - 1]),
             yyy[:0:-1],
-            ))
+        )
+    )
 
     lons, lats = proj(x_v, y_v, inverse=True)
     # NOTE: the inverse projection of a "wrapped" latlong
@@ -624,7 +634,7 @@ def train_weights(station_list, gid, lsm=False):
     # In the very exceptional case that i0==nlon-1 (*exactly* on the outside border)
     # we may not use i0+1, but since the weights will be zero anyway, we can change to
     # any other value...
-    #if i0 == nlon - 1:
+    # if i0 == nlon - 1:
     #    if i != i0:
     #        # The points were not correctly constrained to domain!
     j0 = np.floor(j).astype("i4")
@@ -641,7 +651,6 @@ def train_weights(station_list, gid, lsm=False):
         ic[ic == -1] = gridinfo["nlon"]
         i1[i1 == gridinfo["nlon"]] = 0
         i0[i0 == -1] = gridinfo["nlon"]
-
 
     for pp in range(nstations):
         nearestweights.append([[[ic[pp], jc[pp]], 1.0]])
@@ -701,10 +710,10 @@ def get_grid_values(gid):
     order = "C" if ginfo["jPointsAreConsecutive"] else "F"
     data = eccodes.codes_get_values(gid).reshape(nx, ny, order=order)
     if ginfo["iScansNegatively"]:
-        logger.warning("Untested data ordering iScansNegatively=1")
+        # logger.warning("Untested data ordering iScansNegatively=1")
         data[range(nx), :] = data[range(nx)[::-1], :]
     if not ginfo["jScansPositively"]:
-        logger.warning("Untested data ordering jScansPositively=0")
+        # logger.warning("Untested data ordering jScansPositively=0")
         data[:, range(ny)] = data[:, range(ny)[::-1]]
 
     return data
@@ -723,20 +732,20 @@ def combine_fields(param, station_list):
     Returns:
         a new data matrix that combines the input fields according to parameter descriptor
     """
-    nfields = len(param['data'])
-    parname = param['harp_param']
-    if 'level' in param:
+    nfields = len(param["data"])
+    parname = param["harp_param"]
+    if "level" in param:
         # NOTE: adding level to the name may sometimes lead to strange results
         #       e.g. S10m10, but it's just for debug messages, so we don't care.
-        parname += str(param['level'])
+        parname += str(param["level"])
 
     if any(dd is None for dd in param["data"]):
         # there are missing fields
         # don't make this a "warning", it would show too often...
-        logger.info(f"COMBINE : missing data fields for parameter {parname}")
+        logger.info("COMBINE : missing data fields for parameter %s.", parname)
         return None
 
-    logger.debug("COMBINING {} fields for {}".format(nfields, parname))
+    logger.debug("COMBINING %i fields for %s", nfields, parname)
 
     npoints = len(param["data"][0])
     result = np.zeros(npoints)
@@ -800,7 +809,7 @@ def rotate_wind(lon, lat, p4):
     Returns:
         angle: correction angle in deg (vector) corresponding to every lat/lon location.
     """
-    if p4['proj'] == "lcc":
+    if p4["proj"] == "lcc":
         rad = np.pi / 180.0
         refcos = np.cos(p4["lat_1"] * rad)
         refsin = np.sin(p4["lat_1"] * rad)
@@ -808,11 +817,11 @@ def rotate_wind(lon, lat, p4):
         mapfactor = np.power(refcos / np.cos(lat * rad), 1 - refcos) * np.power(
             (1 + refsin) / (1 + np.sin(lat * rad)), refsin
         )
-    elif p4['proj'] == "latlong":
+    elif p4["proj"] == "latlong":
         angle = np.zeros(len(lat))
         mapfactor = np.ones(len(lat))
     else:
-        logger.error(f"Unimplemented wind rotation for projection {p4['proj']}.")
+        logger.error("Unimplemented wind rotation for projection %s.", p4["proj"])
         angle = np.zeros(len(lat))
         mapfactor = np.ones(len(lat))
 
@@ -835,15 +844,15 @@ def parse_parameter_list(param_list):
     param_cmb_list = []
 
     for param in param_list:
-        if isinstance(param['grib_id'], dict):
+        if isinstance(param["grib_id"], dict):
             # a single field is decoded for this parameter
-            if "level" in param['grib_id'] and isinstance(
-                param['grib_id']['level'], list
+            if "level" in param["grib_id"] and isinstance(
+                param["grib_id"]["level"], list
             ):
                 # expand to multiple fields
-                for lev in param['grib_id']['level']:
+                for lev in param["grib_id"]["level"]:
                     pid = deepcopy(param)
-                    pid['grib_id']['level'] = str(lev)
+                    pid["grib_id"]["level"] = str(lev)
                     param_sgl_list.append(pid)
             else:
                 pid = deepcopy(param)
@@ -855,13 +864,13 @@ def parse_parameter_list(param_list):
             # the parameter requires multiple fields
             # so we will have to cache the data and calculate later
             # for e.g. wind fields we must also cache grid and projection settings
-            nfields = len(param['grib_id'])
+            nfields = len(param["grib_id"])
             if "common" not in param:
                 # the most simple combine case: no common keys
                 pid = deepcopy(param)
-                pid['data'] = [None] * nfields
-                pid['gridinfo'] = None
-                pid['proj4'] = None
+                pid["data"] = [None] * nfields
+                pid["gridinfo"] = None
+                pid["proj4"] = None
                 param_cmb_list.append(pid)
 
             elif "level" in param["common"] and isinstance(
@@ -927,16 +936,17 @@ def cache_field(param, data, param_cmb_list, gid):
       gid: GRIB handle (needed to cache the projection and grid details for every field)
 
     Returns:
-      a count of the number of matching parameters
-      usually 0 or 1, but wind components may be used for direction and speed, so matched twice
+      A count of the number of matching parameters.
+      Usually 0 or 1, but wind components may be used for direction and speed,
+      so may be matched twice.
     """
     count = 0
     gridinfo_list = ["uvRelativeToGrid"]
     for cmb in param_cmb_list:
         nfields = len(cmb["grib_id"])
         for ff in range(nfields):
-            if match_keys(cmb['grib_id'][ff], param['grib_id']):
-                logger.debug(f"Caching output for {cmb['harp_param']}")
+            if match_keys(cmb["grib_id"][ff], param["grib_id"]):
+                logger.debug("Caching output for %s", cmb["harp_param"])
                 cmb["data"][ff] = np.array(data)
                 # FIXME: we assume the unit is the same for all constituents and result
                 #        this is NOT the case for e.g. wind direction
@@ -949,15 +959,15 @@ def cache_field(param, data, param_cmb_list, gid):
                     cmb["proj4"] = get_proj4(gid)
                 count += 1
                 continue
-    logger.debug(f"Found {count} matching combined parameters.")
+    logger.debug("Found %i matching combined parameters.", count)
     return count
 
 
 def parse_grib_file(
     infile,
-    param_list = default_parameter_list,
-    station_list = default_station_list,
-    sqlite_template = default_sqlite_template,
+    param_list=default_parameter_list,
+    station_list=default_station_list,
+    sqlite_template=default_sqlite_template,
     weights=None,
     model_name="TEST",
 ):
@@ -987,10 +997,9 @@ def parse_grib_file(
             param_cmb_cache[pp] = {}
 
     logger.info(
-        "SQLITE: expecting {} single and {} combined parameters.".format(
+        "SQLITE: expecting %i single and %i combined parameters.",
         len(param_sgl_list),
         len(param_cmb_list),
-        )
     )
 
     fcdate = None
@@ -1013,8 +1022,7 @@ def parse_grib_file(
             if param is not None:
                 direct = True
                 gd += 1
-                logger.debug("SQLITE: found parameter {}".format(
-                    param["harp_param"]))
+                logger.debug("SQLITE: found parameter %s", param["harp_param"])
             else:
                 # the record is not in our "direct" parameter list
                 param = param_match(gid, param_cmb_list)
@@ -1025,10 +1033,9 @@ def parse_grib_file(
                 direct = False
                 gc += 1
                 logger.debug(
-                    "SQLITE: found combinded parameter {}:{}".format(
+                    "SQLITE: found combinded parameter %s:%s",
                     param["harp_param"],
                     param["grib_id"],
-                    )
                 )
 
             # we have a matching parameter
@@ -1037,13 +1044,12 @@ def parse_grib_file(
             #       and we could even consider those to be known
             fcdate, leadtime = get_date_info(gid)
             logger.debug(
-                "SQLITE: gt={} gi={} fcdate={}, leadtime={}, direct={}".format(
+                "SQLITE: gt=%i gi=%i fcdate=%s, leadtime=%i, direct=%s",
                 gt,
                 gi,
-                fcdate,
+                fcdate.isoformat(),
                 leadtime,
                 direct,
-                )
             )
 
             if weights is None:
@@ -1060,8 +1066,9 @@ def parse_grib_file(
                     break
 
                 logger.info(
-                    "SQLITE: selected {} stations inside domain from {}.".format(
-                        station_list.shape[0], nstation_orig)
+                    "SQLITE: selected %i stations inside domain from %i.",
+                    station_list.shape[0],
+                    nstation_orig,
                 )
                 # create a list of interpolation weights
                 logger.debug("SQLITE: training interpolation weights.")
@@ -1100,7 +1107,7 @@ def parse_grib_file(
     # at this point, all grib records have been parsed (or an error occured)
     if error_occured:
         logger.error("An error occured. Exiting.")
-        return gt, gi, gd, gc
+        return gt, gi
 
     # OK, we have parsed the whole file and written all "direct" parameters
     # So now we still need to check all the "combined" ones
@@ -1117,8 +1124,15 @@ def parse_grib_file(
                 data_vector, station_list, param, fcdate, leadtime, model_name + "_det"
             )
             write_to_sqlite(data, sqlite_file, param, model_name + "_det")
+    logger.info(
+        "SQLITE: Total %i records. %i matching of which %i direct and %i combined.",
+        gt,
+        gi,
+        gd,
+        gc,
+    )
     # Return: total count and # of matching param
-    return gt, gi, gd, gc
+    return gt, gi
 
 
 def create_table(data_vector, station_list, param, fcdate, leadtime, model_name):
@@ -1127,7 +1141,7 @@ def create_table(data_vector, station_list, param, fcdate, leadtime, model_name)
     Args:
       data_vector: numpy vector with interpolated values
       station_list: pandas table with station list
-      param: parameter desctiptor
+      param: parameter descriptor
       fcdate: forecast date (datetime object)
       leadtime: lead time (int)
       model_name: model name (string)
@@ -1157,7 +1171,7 @@ def create_table(data_vector, station_list, param, fcdate, leadtime, model_name)
     data["valid_dttm"] = vad
     data["parameter"] = param["harp_param"]
     data["units"] = param["units"]
-    logger.debug("SQLITE: writing parameter {}".format(param["harp_param"]))
+    logger.debug("SQLITE: writing parameter %s", param["harp_param"])
     # model_elevation only relevant for T2m
     # NOTE: we can not yet read model elevation from clim file!
     # otherwise remove column
@@ -1186,7 +1200,7 @@ def write_to_sqlite(data, sqlite_file, param, model_name):
         param: parameter descriptor
         model_name: model name used in file path and data table
     """
-    logger.debug("Writing to {}".format(sqlite_file))
+    logger.debug("Writing to %s", sqlite_file)
 
     if os.path.isfile(sqlite_file):
         con = sqlite3.connect(sqlite_file)
@@ -1206,10 +1220,10 @@ def write_to_sqlite(data, sqlite_file, param, model_name):
     else:
         sqlite_path = os.path.dirname(sqlite_file)
         if not os.path.isdir(sqlite_path):
-            logger.info("SQLITE: Creating directory {}.".format(sqlite_path))
+            logger.info("SQLITE: Creating directory %s.", sqlite_path)
             os.makedirs(sqlite_path)
         # if the SQLite file doesn't exist yet: create the SQLite table
-        logger.info("SQLITE: Creating sqlite file {}.".format(sqlite_file))
+        logger.info("SQLITE: Creating sqlite file %s.", sqlite_file)
         con = db_create(sqlite_file, param, model_name)
 
     if con is not None:
@@ -1219,7 +1233,7 @@ def write_to_sqlite(data, sqlite_file, param, model_name):
         #       BUT: this may change if harpPoint gets support for sub-hourly data
         fcd = float(data.iloc[0]["fcst_dttm"])
         leadtime = float(data.iloc[0]["lead_time"])
-        logger.debug("leadtime: {}".format(leadtime))
+        logger.debug("leadtime (h): %i", leadtime)
         db_cleanup(param, fcd, leadtime, con)
 
         # now write to SQLite
@@ -1238,7 +1252,7 @@ def db_cleanup(param, fcd, leadtime, con):
         leadtime: lead time (int)
         con: database connection
     """
-    logger.debug(f"Cleanup: ldt={leadtime}")
+    logger.debug("Cleanup: ldt=%i", leadtime)
     cleanup = "DELETE from FC WHERE fcst_dttm=? AND lead_time=?"
     cur = con.cursor()
     # NOTE: variables must be cast to int (or float),
@@ -1338,5 +1352,3 @@ def fctable_definition(param, model_name):
 
     all_keys = {**primary_keys, **other_keys}
     return (primary_keys, all_keys)
-
-
