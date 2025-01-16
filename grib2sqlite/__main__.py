@@ -79,14 +79,11 @@ for file_glob in infile:
         if not os.path.isfile(file_name):
             logger.warning(f"GRIB file not found: {file_name}")
             continue
-        gt, gi, gd, gc = parse_grib_file(
+        gt, gi = parse_grib_file(
             infile = file_name,
             param_list = param_file,
             station_list = station_file,
             sqlite_template = sqlite_template,
             model_name = model_name,
             weights = None)
-        logger.info(f"Found {gt} grib messages, of which {gi} matching.")
-        logger.info(f"Found {gd} direct parameters, {gc} combined.")
-
 
