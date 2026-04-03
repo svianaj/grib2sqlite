@@ -4,6 +4,7 @@
 import logging
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from copy import deepcopy
 from datetime import datetime
@@ -27,6 +28,31 @@ basedir = os.path.dirname(__file__)
 default_parameter_list = basedir + "/data/param_list_default.json"
 default_station_list = basedir + "/data/station_list_default.csv"
 default_sqlite_template = "{MODEL}/{YYYY}/{MM}/FCTABLE_{PP}_{YYYY}{MM}.sqlite"
+
+# Per-SQLite-file locks used by parallel workers (threads) to serialise the
+# file-creation step and avoid "duplicate column name" races.
+_sqlite_file_locks: dict = {}
+_sqlite_file_locks_lock = threading.Lock()
+
+
+def _get_file_lock(path: str) -> threading.Lock:
+    """Return a per-file threading.Lock, creating it on first use.
+
+    All workers that share the same process (e.g. ThreadPoolExecutor) will
+    receive the same lock object for the same absolute path, serialising the
+    SQLite file-creation and schema-patching steps without blocking unrelated
+    files.
+
+    Args:
+        path: absolute or relative path to the SQLite file
+
+    Returns:
+        A threading.Lock unique to this path.
+    """
+    with _sqlite_file_locks_lock:
+        if path not in _sqlite_file_locks:
+            _sqlite_file_locks[path] = threading.Lock()
+        return _sqlite_file_locks[path]
 
 
 def read_param_list(param_file):
@@ -1036,6 +1062,55 @@ def cache_field(param, data, param_cmb_list, gid):
     return count
 
 
+def cache_field_ensemble(param, data, param_cmb_list, gid, perturbation_number):
+    """Cache a decoded field for a specific ensemble member in combined parameters.
+
+    Unlike cache_field (which overwrites a single data slot), this function
+    stores each member's component data separately under
+    cmb["member_data"][perturbation_number][field_index], so that
+    combine_fields can later be called independently for every member.
+
+    Args:
+      param              : parameter description of the current data
+      data               : interpolated data vector for this member
+      param_cmb_list     : list of combined parameter descriptors (MODIFIED in place)
+      gid                : GRIB handle (for projection / grid info)
+      perturbation_number: integer member number (1-based)
+
+    Returns:
+      Count of combined parameters that matched.
+    """
+    count = 0
+    gridinfo_list = ["uvRelativeToGrid"]
+    for cmb in param_cmb_list:
+        nfields = len(cmb["grib_id"])
+        for ff in range(nfields):
+            if match_keys(cmb["grib_id"][ff], param["grib_id"]):
+                logger.debug(
+                    "Caching ensemble member %i for %s",
+                    perturbation_number,
+                    cmb["harp_param"],
+                )
+                # Initialise per-member storage on first encounter
+                if "member_data" not in cmb:
+                    cmb["member_data"] = {}
+                if perturbation_number not in cmb["member_data"]:
+                    cmb["member_data"][perturbation_number] = [None] * nfields
+                cmb["member_data"][perturbation_number][ff] = np.array(data)
+
+                # These are the same for all members — set once
+                cmb["units"] = param["units"]
+                cmb["level"] = param["level"]
+                cmb["level_name"] = param["level_name"]
+                if cmb["gridinfo"] is None:
+                    cmb["gridinfo"] = get_keylist(gid, gridinfo_list, "long")
+                    cmb["proj4"] = get_proj4(gid)
+                count += 1
+                continue
+    logger.debug("Found %i matching combined parameters for member %i.", count, perturbation_number)
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Ensemble accumulator
 # ---------------------------------------------------------------------------
@@ -1069,7 +1144,7 @@ class _EnsembleAccumulator:
         return len(self.members) == self.n_members
 
     def missing_members(self):
-        return sorted(set(range(1, self.n_members + 1)) - set(self.members.keys()))
+        return sorted(set(range(0, self.n_members + 1)) - set(self.members.keys()))
 
 
 def _ens_key(param, fcdate, leadtime):
@@ -1227,11 +1302,9 @@ def parse_grib_file(
                     continue
 
                 # Cache data for combined parameters (wind speed/direction etc.)
-                # NOTE: in ensemble mode cache_field is called for every member,
-                # so the last member's data will be cached.  Combined ensemble
-                # parameters are therefore only written for the last member seen,
-                # which is a known limitation for now.
-                cache_field(param, data_vector, param_cmb_list, gid)
+                # Each member's components are stored separately so that
+                # combine_fields can be called independently per member.
+                cache_field_ensemble(param, data_vector, param_cmb_list, gid, perturbation_number)
 
                 if direct:
                     key = _ens_key(param, fcdate, leadtime)
@@ -1277,12 +1350,13 @@ def parse_grib_file(
         return gt, gi
 
     # Flush any accumulators that never reached n_members (missing members at
-    # end of file).  Write partial data and warn rather than silently discard.
+    # end of file).  This is normal for split ensemble files where the control
+    # member (e.g. member 51) lives in a separate file.
     for key, accum in ens_accumulators.items():
         missing = accum.missing_members()
-        logger.warning(
-            "SQLITE: incomplete ensemble for %s fcdate=%s leadtime=%s – "
-            "missing members %s. Writing partial data.",
+        logger.info(
+            "SQLITE: partial ensemble flush for %s fcdate=%s leadtime=%s – "
+            "members not in this file: %s.",
             accum.param["harp_param"],
             accum.fcdate,
             accum.leadtime,
@@ -1293,26 +1367,58 @@ def parse_grib_file(
     # Check all combined parameters and write to SQLite
     logger.debug("SQLITE: checking cached combined fields")
     for param in param_cmb_list:
-        data_vector = combine_fields(param, station_list)
-        # only write to SQLite if ALL components were found!
-        if data_vector is not None:
-            logger.debug("SQLITE: writing combined field")
-            sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
-            if ensemble:
-                # Combined fields in ensemble mode are written with plain model_name
-                # (no _det suffix, no member suffix) as a best-effort fallback,
-                # since the accumulator design only supports single/direct fields.
-                logger.warning(
-                    "SQLITE: combined ensemble field %s written with plain model name.",
-                    param["harp_param"],
+        if ensemble:
+            # In ensemble mode each member's components were stored separately
+            # by cache_field_ensemble.  Combine and accumulate per member, then
+            # flush exactly like a direct ensemble parameter.
+            member_data = param.get("member_data", {})
+            if not member_data:
+                logger.info(
+                    "COMBINE: no ensemble member data cached for %s.", param["harp_param"]
                 )
-                col_name = model_name
-            else:
+                continue
+
+            # Determine n_members from any available accumulator, or fall back
+            # to the number of members actually seen for this combined param.
+            n_members = max(member_data.keys())
+
+            cmb_accum = _EnsembleAccumulator(n_members, param, fcdate, leadtime)
+            for mbr_num, component_data in member_data.items():
+                # Temporarily swap in this member's component data so that
+                # combine_fields (which reads param["data"]) works unchanged.
+                param["data"] = component_data
+                data_vector = combine_fields(param, station_list)
+                if data_vector is not None:
+                    cmb_accum.add(mbr_num, data_vector)
+                else:
+                    logger.info(
+                        "COMBINE: missing component for %s member %i – skipping member.",
+                        param["harp_param"],
+                        mbr_num,
+                    )
+
+            if cmb_accum.members:
+                missing = cmb_accum.missing_members()
+                if missing:
+                    logger.info(
+                        "SQLITE: partial combined ensemble flush for %s – "
+                        "members not in this file: %s.",
+                        param["harp_param"],
+                        missing,
+                    )
+                _flush_ensemble(cmb_accum, station_list, model_name, sqlite_template)
+        else:
+            # Deterministic: single combine_fields call, write directly.
+            data_vector = combine_fields(param, station_list)
+            # only write to SQLite if ALL components were found!
+            if data_vector is not None:
+                logger.debug("SQLITE: writing combined field")
+                sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
                 col_name = model_name + "_det"
-            data = create_table(
-                data_vector, station_list, param, fcdate, leadtime, col_name
-            )
-            write_to_sqlite(data, sqlite_file, param, col_name)
+                data = create_table(
+                    data_vector, station_list, param, fcdate, leadtime, col_name
+                )
+                write_to_sqlite(data, sqlite_file, param, col_name)
 
     logger.info(
         "SQLITE: Total %i records. %i matching of which %i direct and %i combined.",
@@ -1346,27 +1452,38 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template):
 
     sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
 
-    # Create the SQLite file / table if it doesn't exist yet.
-    # _db_create_ensemble already defines ALL n_members columns, so we must NOT
-    # call _ensure_member_columns afterwards — that would try to add them again
-    # and raise "duplicate column name".
-    if not os.path.isfile(sqlite_file):
-        sqlite_path = os.path.dirname(sqlite_file)
-        if sqlite_path and not os.path.isdir(sqlite_path):
-            logger.info("SQLITE: Creating directory %s.", sqlite_path)
-            os.makedirs(sqlite_path)
-        logger.info("SQLITE: Creating ensemble sqlite file %s.", sqlite_file)
-        _db_create_ensemble(sqlite_file, param, model_name, accum.n_members)
-        needs_column_check = False
-    else:
-        # File pre-existed: patch any member columns that may be missing
-        # (e.g. file created by an earlier partial flush or a different run).
-        needs_column_check = True
+    # Serialise file creation and schema patching across parallel workers.
+    # Without this lock, two threads can both see os.path.isfile()==False and
+    # both call _db_create_ensemble, producing "duplicate column name" errors.
+    file_lock = _get_file_lock(sqlite_file)
+    with file_lock:
+        if not os.path.isfile(sqlite_file):
+            sqlite_path = os.path.dirname(sqlite_file)
+            if sqlite_path and not os.path.isdir(sqlite_path):
+                logger.info("SQLITE: Creating directory %s.", sqlite_path)
+                os.makedirs(sqlite_path)
+            logger.info("SQLITE: Creating ensemble sqlite file %s.", sqlite_file)
+            _db_create_ensemble(sqlite_file, param, model_name, accum.n_members)
+            needs_column_check = False
+        else:
+            # File pre-existed: patch any member columns that may be missing
+            # (e.g. file created by an earlier partial flush or a different run).
+            needs_column_check = True
 
+        con = sqlite3.connect(sqlite_file)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
+
+        if needs_column_check:
+            _ensure_member_columns(con, model_name, sorted(accum.members.keys()))
+
+        con.commit()
+        con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
+
+    # Schema is now stable — the data write itself is safe outside the lock
+    # because SQLite WAL mode allows concurrent writers at the row level.
     con = sqlite3.connect(sqlite_file)
-
-    if needs_column_check:
-        _ensure_member_columns(con, model_name, sorted(accum.members.keys()))
+    con.execute("PRAGMA journal_mode=WAL")
 
     fcd = float(fcdate.timestamp())
     db_cleanup(param, fcd, float(leadtime / 3600.0), con)
@@ -1459,7 +1576,7 @@ def _fctable_definition_ensemble(param, model_name, n_members):
         "units": "TEXT",
     }
     # one column per member
-    for mbr in range(1, n_members + 1):
+    for mbr in range(0, n_members + 1):
         other_keys[mbr_column(model_name, mbr)] = "DOUBLE"
 
     # T2m elevation correction columns
@@ -1560,6 +1677,8 @@ def write_to_sqlite(data, sqlite_file, param, model_name):
 
     if os.path.isfile(sqlite_file):
         con = sqlite3.connect(sqlite_file)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
         # NOTE: If the table already exists,
         #       we must check that all column names match!
         #       Especially, we must check that the model name is identical.
