@@ -411,44 +411,6 @@ def mbr_column(model_name, perturbation_number):
     """
     return f"{model_name}_mbr{perturbation_number:03d}"
 
-
-def _strip_pdt(param_list):
-    """Return a deep copy of param_list with productDefinitionTemplateNumber removed.
-
-    In ensemble GRIB files, instantaneous fields use PDT=1 and
-    statistical/accumulated fields use PDT=11, whereas param lists written
-    for deterministic files typically use PDT=0 / PDT=8.
-    Removing the constraint allows the same param list to be reused for
-    ensemble files without modification.
-
-    typeOfStatisticalProcessing is also removed, as it is only meaningful
-    in combination with a specific PDT.
-
-    Args:
-        param_list: list of parameter descriptors (as loaded from json file)
-
-    Returns:
-        A deep copy with productDefinitionTemplateNumber and
-        typeOfStatisticalProcessing removed from every grib_id entry
-        (both single-dict and list-of-dicts forms) and from 'common' blocks.
-    """
-    result = deepcopy(param_list)
-    _pdt_keys = {"productDefinitionTemplateNumber", "typeOfStatisticalProcessing"}
-    for param in result:
-        grib_id = param["grib_id"]
-        if isinstance(grib_id, dict):
-            for k in _pdt_keys:
-                grib_id.pop(k, None)
-        elif isinstance(grib_id, list):
-            for g in grib_id:
-                for k in _pdt_keys:
-                    g.pop(k, None)
-        if "common" in param:
-            for k in _pdt_keys:
-                param["common"].pop(k, None)
-    return result
-
-
 def param_match(gid, parameter_list):
     """Check whether a grib record is in the list of required parameters.
 
@@ -1185,12 +1147,6 @@ def parse_grib_file(
         station_list = read_station_list(station_list)
     if isinstance(param_list, str):
         param_list = read_param_list(param_list)
-
-    # In ensemble mode, PDT values written for deterministic files (0, 8) do not
-    # exist in ensemble GRIB files (which use PDT 1 and 11).  Strip them so the
-    # same param list works for both without modification.
-    if ensemble:
-        param_list = _strip_pdt(param_list)
 
     # split into "combined" and "direct" parameters
     param_sgl_list, param_cmb_list = parse_parameter_list(param_list)
